@@ -8,6 +8,7 @@ use hmac::{Hmac, Mac};
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::{Deserialize, Serialize};
+use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -150,7 +151,54 @@ enum PendingFlow {
     },
 }
 
-impl Context for AuthRoot {}
+impl Context for AuthRoot {
+    fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
+        let status = self
+            .get_http_call_response_header(":status")
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(500);
+
+        let body = self
+            .get_http_call_response_body(0, body_size)
+            .unwrap_or_default();
+
+        self.jwks_refresh_in_flight = false;
+
+        if status / 100 != 2 {
+            proxy_wasm::hostcalls::log(
+                LogLevel::Warn,
+                &format!("jwks refresh failed with status {status}"),
+            )
+            .ok();
+            return;
+        }
+
+        match std::str::from_utf8(&body) {
+            Ok(s) => {
+                if self
+                    .set_shared_data("jwks_cache", Some(s.as_bytes()), None)
+                    .is_ok()
+                {
+                    self.jwks_cache_loaded_at = now_epoch_sec();
+                    proxy_wasm::hostcalls::log(LogLevel::Info, "jwks cache updated").ok();
+                } else {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Warn,
+                        "jwks shared_data write failed",
+                    )
+                    .ok();
+                }
+            }
+            Err(e) => {
+                proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    &format!("jwks body invalid utf8: {e}"),
+                )
+                .ok();
+            }
+        }
+    }
+}
 
 impl RootContext for AuthRoot {
     fn on_configure(&mut self, _: usize) -> bool {
@@ -225,10 +273,12 @@ impl RootContext for AuthRoot {
 
         self.jwks_refresh_in_flight = true;
 
+        let jwks_path = extract_path_and_query(&cfg.jwks_uri);
+        let jwks_authority = extract_authority(&cfg.jwks_uri);
         let headers = vec![
             (":method", "GET"),
-            (":path", extract_path_and_query(&cfg.jwks_uri).as_str()),
-            (":authority", extract_authority(&cfg.jwks_uri).as_str()),
+            (":path", jwks_path.as_str()),
+            (":authority", jwks_authority.as_str()),
         ];
 
         match self.dispatch_http_call(
@@ -250,54 +300,7 @@ impl RootContext for AuthRoot {
         }
     }
 
-    fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
-        let status = self
-            .get_http_call_response_header(":status")
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(500);
-
-        let body = self
-            .get_http_call_response_body(0, body_size)
-            .unwrap_or_default();
-
-        self.jwks_refresh_in_flight = false;
-
-        if status / 100 != 2 {
-            proxy_wasm::hostcalls::log(
-                LogLevel::Warn,
-                &format!("jwks refresh failed with status {status}"),
-            )
-            .ok();
-            return;
-        }
-
-        match std::str::from_utf8(&body) {
-            Ok(s) => {
-                if self
-                    .set_shared_data("jwks_cache", Some(s.as_bytes()), None)
-                    .is_ok()
-                {
-                    self.jwks_cache_loaded_at = now_epoch_sec();
-                    proxy_wasm::hostcalls::log(LogLevel::Info, "jwks cache updated").ok();
-                } else {
-                    proxy_wasm::hostcalls::log(
-                        LogLevel::Warn,
-                        "jwks shared_data write failed",
-                    )
-                    .ok();
-                }
-            }
-            Err(e) => {
-                proxy_wasm::hostcalls::log(
-                    LogLevel::Warn,
-                    &format!("jwks body invalid utf8: {e}"),
-                )
-                .ok();
-            }
-        }
-    }
-
-    fn on_start(&mut self) -> bool {
+    fn on_vm_start(&mut self, _: usize) -> bool {
         self.set_tick_period(Duration::from_secs(120));
         true
     }
@@ -307,87 +310,7 @@ impl RootContext for AuthRoot {
     }
 }
 
-impl Context for AuthHttp {}
-
-impl HttpContext for AuthHttp {
-    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-        let path = self
-            .get_http_request_header(":path")
-            .unwrap_or_else(|| "/".into());
-
-        if path.starts_with(START_PATH) {
-            let rd = get_query_param(&path, "rd").unwrap_or_else(|| "/".into());
-            return self.redirect_to_login(&rd);
-        }
-
-        if path.starts_with(LOGOUT_PATH) {
-            return self.handle_logout();
-        }
-
-        if path.starts_with(CALLBACK_PATH) {
-            return self.handle_callback(&path);
-        }
-
-        if self.is_public_path(&path) {
-            return Action::Continue;
-        }
-
-        let jwks = match self.get_jwks_cached() {
-            Some(v) => v,
-            None => {
-                self.send_http_response(
-                    503,
-                    vec![("content-type", "text/plain; charset=utf-8")],
-                    Some(b"jwks cache not ready"),
-                );
-                return Action::Pause;
-            }
-        };
-
-        match self.read_cookie(SESSION_COOKIE) {
-            Some(raw) => {
-                let Ok(session) = decrypt_session_cookie(&raw, &self.cfg.crypto_secret) else {
-                    return self.redirect_to_login(&path);
-                };
-
-                let token_to_verify = session
-                    .id_token
-                    .as_deref()
-                    .unwrap_or(session.access_token.as_str());
-
-                match verify_jwt_minimal(
-                    token_to_verify,
-                    &jwks,
-                    &self.cfg.issuer,
-                    &self.cfg.client_id,
-                ) {
-                    Ok(claims) => {
-                        let now = now_epoch_sec();
-
-                        if claims.exp.unwrap_or(0) <= now + self.cfg.refresh_skew_seconds.unwrap_or(60) {
-                            if session.refresh_token.is_some() {
-                                self.pending_redirect = Some(path.clone());
-                                self.pending_flow = Some(PendingFlow::Refresh {
-                                    rd: path.clone(),
-                                    session,
-                                });
-                                self.refresh_token();
-                                return Action::Pause;
-                            } else {
-                                return self.redirect_to_login(&path);
-                            }
-                        }
-
-                        self.inject_identity_headers_from_claims(&session, &claims);
-                        Action::Continue
-                    }
-                    Err(_) => self.redirect_to_login(&path),
-                }
-            }
-            None => self.redirect_to_login(&path),
-        }
-    }
-
+impl Context for AuthHttp {
     fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
         let status = self
             .get_http_call_response_header(":status")
@@ -496,6 +419,87 @@ impl HttpContext for AuthHttp {
             None,
         );
     }
+}
+
+impl HttpContext for AuthHttp {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        let path = self
+            .get_http_request_header(":path")
+            .unwrap_or_else(|| "/".into());
+
+        if path.starts_with(START_PATH) {
+            let rd = get_query_param(&path, "rd").unwrap_or_else(|| "/".into());
+            return self.redirect_to_login(&rd);
+        }
+
+        if path.starts_with(LOGOUT_PATH) {
+            return self.handle_logout();
+        }
+
+        if path.starts_with(CALLBACK_PATH) {
+            return self.handle_callback(&path);
+        }
+
+        if self.is_public_path(&path) {
+            return Action::Continue;
+        }
+
+        let jwks = match self.get_jwks_cached() {
+            Some(v) => v,
+            None => {
+                self.send_http_response(
+                    503,
+                    vec![("content-type", "text/plain; charset=utf-8")],
+                    Some(b"jwks cache not ready"),
+                );
+                return Action::Pause;
+            }
+        };
+
+        match self.read_cookie(SESSION_COOKIE) {
+            Some(raw) => {
+                let Ok(session) = decrypt_session_cookie(&raw, &self.cfg.crypto_secret) else {
+                    return self.redirect_to_login(&path);
+                };
+
+                let token_to_verify = session
+                    .id_token
+                    .as_deref()
+                    .unwrap_or(session.access_token.as_str());
+
+                match verify_jwt_minimal(
+                    token_to_verify,
+                    &jwks,
+                    &self.cfg.issuer,
+                    &self.cfg.client_id,
+                ) {
+                    Ok(claims) => {
+                        let now = now_epoch_sec();
+
+                        if claims.exp.unwrap_or(0) <= now + self.cfg.refresh_skew_seconds.unwrap_or(60) {
+                            if session.refresh_token.is_some() {
+                                self.pending_redirect = Some(path.clone());
+                                self.pending_flow = Some(PendingFlow::Refresh {
+                                    rd: path.clone(),
+                                    session,
+                                });
+                                self.refresh_token();
+                                return Action::Pause;
+                            } else {
+                                return self.redirect_to_login(&path);
+                            }
+                        }
+
+                        self.inject_identity_headers_from_claims(&session, &claims);
+                        Action::Continue
+                    }
+                    Err(_) => self.redirect_to_login(&path),
+                }
+            }
+            None => self.redirect_to_login(&path),
+        }
+    }
+
 }
 
 impl AuthHttp {
@@ -686,10 +690,12 @@ impl AuthHttp {
     }
 
     fn dispatch_token_request(&mut self, body: &str) {
+        let token_path = extract_path_and_query(&self.cfg.token_endpoint);
+        let token_authority = extract_authority(&self.cfg.token_endpoint);
         let headers = vec![
             (":method", "POST"),
-            (":path", extract_path_and_query(&self.cfg.token_endpoint).as_str()),
-            (":authority", extract_authority(&self.cfg.token_endpoint).as_str()),
+            (":path", token_path.as_str()),
+            (":authority", token_authority.as_str()),
             ("content-type", "application/x-www-form-urlencoded"),
         ];
 
@@ -833,7 +839,7 @@ fn pkce_s256(verifier: &str) -> String {
 
 fn sign_blob(payload: &[u8], secret: &str) -> Result<String, String> {
     let body = URL_SAFE_NO_PAD.encode(payload);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
+    let mut mac: HmacSha256 = Mac::new_from_slice(secret.as_bytes()).map_err(|e: hmac::digest::InvalidLength| e.to_string())?;
     mac.update(body.as_bytes());
     let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     Ok(format!("{body}.{sig}"))
@@ -841,7 +847,7 @@ fn sign_blob(payload: &[u8], secret: &str) -> Result<String, String> {
 
 fn verify_signed_blob(value: &str, secret: &str) -> Result<Vec<u8>, String> {
     let (body, sig) = value.rsplit_once('.').ok_or("bad format")?;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
+    let mut mac: HmacSha256 = Mac::new_from_slice(secret.as_bytes()).map_err(|e: hmac::digest::InvalidLength| e.to_string())?;
     mac.update(body.as_bytes());
     let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     if expected != sig {
@@ -903,53 +909,123 @@ fn decode_jwt_claims(jwt: &str) -> Result<JwtClaims, String> {
     serde_json::from_slice::<JwtClaims>(&bytes).map_err(|e| e.to_string())
 }
 
+fn verify_rsa_pkcs1_sha256(
+    n_b64: &str,
+    e_b64: &str,
+    signing_input: &[u8],
+    signature_b64: &str,
+) -> Result<(), String> {
+    let n_bytes = URL_SAFE_NO_PAD
+        .decode(n_b64)
+        .map_err(|e| format!("n decode: {e}"))?;
+    let e_bytes = URL_SAFE_NO_PAD
+        .decode(e_b64)
+        .map_err(|e| format!("e decode: {e}"))?;
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|e| format!("sig decode: {e}"))?;
+
+    let n = BigUint::from_bytes_be(&n_bytes);
+    let e = BigUint::from_bytes_be(&e_bytes);
+    let sig = BigUint::from_bytes_be(&sig_bytes);
+
+    let em_len = n_bytes.len();
+
+    // RSA public key operation: m = sig^e mod n
+    let m = sig.modpow(&e, &n);
+    let m_bytes = m.to_bytes_be();
+
+    // Left-pad to em_len
+    let mut em = vec![0u8; em_len];
+    let offset = em_len.saturating_sub(m_bytes.len());
+    em[offset..].copy_from_slice(&m_bytes);
+
+    // Verify PKCS#1 v1.5: 0x00 0x01 [0xff * N] 0x00 [DigestInfo] [hash]
+    if em.len() < 2 || em[0] != 0x00 || em[1] != 0x01 {
+        return Err("pkcs1: bad header".into());
+    }
+
+    // DigestInfo prefix for SHA-256 (RFC 3447)
+    const SHA256_DIGEST_INFO: &[u8] = &[
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+        0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+    ];
+
+    let hash = Sha256::digest(signing_input);
+    let mut expected_tail = SHA256_DIGEST_INFO.to_vec();
+    expected_tail.extend_from_slice(hash.as_slice());
+    // expected_tail.len() == 19 + 32 == 51
+
+    let suffix_len = expected_tail.len();
+    if em_len < suffix_len + 3 {
+        return Err("pkcs1: em too short".into());
+    }
+    let tail_start = em_len - suffix_len;
+
+    if &em[tail_start..] != expected_tail.as_slice() {
+        return Err("pkcs1: digest mismatch".into());
+    }
+
+    // Separator byte before tail
+    if em[tail_start - 1] != 0x00 {
+        return Err("pkcs1: missing separator".into());
+    }
+
+    // All padding bytes must be 0xff (minimum 8 per RFC 3447)
+    let pad = &em[2..tail_start - 1];
+    if pad.len() < 8 || pad.iter().any(|&b| b != 0xff) {
+        return Err("pkcs1: bad padding".into());
+    }
+
+    Ok(())
+}
+
 fn verify_jwt_minimal(jwt: &str, jwks: &Jwks, issuer: &str, client_id: &str) -> Result<JwtClaims, String> {
     let header = decode_jwt_header(jwt)?;
     let claims = decode_jwt_claims(jwt)?;
 
-    if header.alg.as_deref() != Some("RS256") {
-        return Err("only RS256 supported in this skeleton".into());
+    let alg = header.alg.as_deref().unwrap_or("");
+    if alg != "RS256" {
+        return Err(format!("unsupported algorithm: {alg}"));
     }
 
     let kid = header.kid.as_deref().ok_or("missing kid")?;
-    let _jwk = jwks
+    let jwk = jwks
         .keys
         .iter()
         .find(|k| k.kid.as_deref() == Some(kid))
-        .ok_or("kid not found in jwks")?;
+        .ok_or_else(|| format!("kid {kid} not found in jwks"))?;
 
-    // ВАЖНО:
-    // Здесь должен быть реальный RS256 verify по JWK(n,e).
-    // В данном skeleton-блоке место оставлено намеренно компактным и явным,
-    // чтобы не тащить ещё одну большую криптобиблиотеку и не засорять пример.
-    // Для прод-варианта сюда надо добавить реальную проверку подписи.
-    //
-    // Сейчас блок intentionally fail-closed не пропускает токен без включения verify.
-    return Err("signature verification hook is not enabled in this compact skeleton".into());
+    let n = jwk.n.as_deref().ok_or("jwk missing n")?;
+    let e = jwk.e.as_deref().ok_or("jwk missing e")?;
 
-    #[allow(unreachable_code)]
-    {
-        if claims.iss.as_deref() != Some(issuer) {
-            return Err("issuer mismatch".into());
-        }
+    // signing input = "header_b64.payload_b64" (everything before the last dot)
+    let last_dot = jwt.rfind('.').ok_or("jwt malformed")?;
+    let signing_input = &jwt[..last_dot];
+    let sig_b64 = &jwt[last_dot + 1..];
 
-        if !aud_matches(claims.aud.as_ref(), client_id) {
-            return Err("aud mismatch".into());
-        }
+    verify_rsa_pkcs1_sha256(n, e, signing_input.as_bytes(), sig_b64)?;
 
-        let now = now_epoch_sec();
-        if claims.exp.unwrap_or(0) <= now {
-            return Err("token expired".into());
-        }
-
-        if let Some(nbf) = claims.nbf {
-            if now < nbf {
-                return Err("token is not yet valid".into());
-            }
-        }
-
-        Ok(claims)
+    if claims.iss.as_deref() != Some(issuer) {
+        return Err(format!("issuer mismatch: {:?}", claims.iss));
     }
+
+    if !aud_matches(claims.aud.as_ref(), client_id) {
+        return Err("aud mismatch".into());
+    }
+
+    let now = now_epoch_sec();
+    if claims.exp.unwrap_or(0) <= now {
+        return Err("token expired".into());
+    }
+
+    if let Some(nbf) = claims.nbf {
+        if now < nbf {
+            return Err("token not yet valid".into());
+        }
+    }
+
+    Ok(claims)
 }
 
 fn aud_matches(aud: Option<&serde_json::Value>, client_id: &str) -> bool {
@@ -998,7 +1074,7 @@ fn extract_path_and_query(url: &str) -> String {
 }
 
 fn now_epoch_sec() -> u64 {
-    if let Some(v) = proxy_wasm::hostcalls::get_property(vec!["request", "time"]) {
+    if let Ok(Some(v)) = proxy_wasm::hostcalls::get_property(vec!["request", "time"]) {
         if v.len() >= 8 {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&v[..8]);
