@@ -38,7 +38,7 @@ struct PluginConfig {
     logout_endpoint: Option<String>,
 
     client_id: String,
-    client_secret: String,
+    client_secret: Option<String>,
     redirect_uri: String,
     scope: Option<String>,
 
@@ -237,7 +237,7 @@ impl RootContext for AuthRoot {
                 // Override sensitive fields from env vars if set via vmConfig.env
                 if let Ok(v) = std::env::var("OIDC_CLIENT_SECRET") {
                     if !v.is_empty() {
-                        cfg.client_secret = v;
+                        cfg.client_secret = Some(v);
                     }
                 }
                 if let Ok(v) = std::env::var("SESSION_CRYPTO_SECRET") {
@@ -246,14 +246,6 @@ impl RootContext for AuthRoot {
                     }
                 }
 
-                if cfg.client_secret.is_empty() {
-                    proxy_wasm::hostcalls::log(
-                        LogLevel::Error,
-                        "client_secret not set (pluginConfig or OIDC_CLIENT_SECRET env var)",
-                    )
-                    .ok();
-                    return false;
-                }
                 if cfg.crypto_secret.is_empty() {
                     proxy_wasm::hostcalls::log(
                         LogLevel::Error,
@@ -685,14 +677,16 @@ impl AuthHttp {
             return;
         };
 
-        let body = form_urlencoded::Serializer::new(String::new())
-            .append_pair("grant_type", "authorization_code")
-            .append_pair("code", &code)
-            .append_pair("client_id", &self.cfg.client_id)
-            .append_pair("client_secret", &self.cfg.client_secret)
-            .append_pair("redirect_uri", &self.cfg.redirect_uri)
-            .append_pair("code_verifier", &code_verifier)
-            .finish();
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("grant_type", "authorization_code");
+        ser.append_pair("code", &code);
+        ser.append_pair("client_id", &self.cfg.client_id);
+        if let Some(secret) = self.cfg.client_secret.as_deref() {
+            ser.append_pair("client_secret", secret);
+        }
+        ser.append_pair("redirect_uri", &self.cfg.redirect_uri);
+        ser.append_pair("code_verifier", &code_verifier);
+        let body = ser.finish();
 
         self.dispatch_token_request(&body);
     }
@@ -708,12 +702,14 @@ impl AuthHttp {
             return;
         };
 
-        let body = form_urlencoded::Serializer::new(String::new())
-            .append_pair("grant_type", "refresh_token")
-            .append_pair("refresh_token", &refresh_token)
-            .append_pair("client_id", &self.cfg.client_id)
-            .append_pair("client_secret", &self.cfg.client_secret)
-            .finish();
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("grant_type", "refresh_token");
+        ser.append_pair("refresh_token", &refresh_token);
+        ser.append_pair("client_id", &self.cfg.client_id);
+        if let Some(secret) = self.cfg.client_secret.as_deref() {
+            ser.append_pair("client_secret", secret);
+        }
+        let body = ser.finish();
 
         self.dispatch_token_request(&body);
     }
