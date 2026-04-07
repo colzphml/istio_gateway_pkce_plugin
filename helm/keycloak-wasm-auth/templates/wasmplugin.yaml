@@ -1,0 +1,62 @@
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: {{ include "keycloak-wasm-auth.fullname" . }}
+  namespace: {{ .Values.istio.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selector:
+    matchLabels:
+      {{- toYaml .Values.istio.ingressGateway.selectorLabels | nindent 6 }}
+  url: oci://{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}
+  {{- if .Values.image.pullSecret }}
+  imagePullSecret: {{ .Values.image.pullSecret }}
+  {{- end }}
+  phase: AUTHN
+  vmConfig:
+    env:
+    - name: OIDC_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "keycloak-wasm-auth.secretName" . }}
+          key: client_secret
+    - name: SESSION_CRYPTO_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "keycloak-wasm-auth.secretName" . }}
+          key: crypto_secret
+  pluginConfig:
+    issuer: {{ include "keycloak-wasm-auth.issuer" . | quote }}
+    authorization_endpoint: {{ include "keycloak-wasm-auth.authEndpoint" . | quote }}
+    token_endpoint: {{ include "keycloak-wasm-auth.tokenEndpoint" . | quote }}
+    jwks_uri: {{ include "keycloak-wasm-auth.jwksUri" . | quote }}
+    logout_endpoint: {{ include "keycloak-wasm-auth.logoutEndpoint" . | quote }}
+
+    client_id: {{ .Values.oidc.clientId | quote }}
+    client_secret: ""
+    redirect_uri: {{ .Values.oidc.redirectUri | quote }}
+    scope: {{ .Values.oidc.scope | quote }}
+
+    cookie_domain: {{ .Values.cookie.domain | quote }}
+    cookie_path: {{ .Values.cookie.path | quote }}
+    cookie_secure: {{ .Values.cookie.secure }}
+    cookie_samesite: {{ .Values.cookie.sameSite | quote }}
+
+    crypto_secret: ""
+
+    upstream_cluster: {{ include "keycloak-wasm-auth.upstreamCluster" . | quote }}
+
+    refresh_skew_seconds: {{ .Values.session.refreshSkewSeconds }}
+    pass_authorization_header: {{ .Values.headers.passAuthorization }}
+
+    user_header: {{ .Values.headers.user | quote }}
+    email_header: {{ .Values.headers.email | quote }}
+    groups_header: {{ .Values.headers.groups | quote }}
+
+    public_prefixes:
+    {{- range .Values.publicPrefixes }}
+    - {{ . | quote }}
+    {{- end }}

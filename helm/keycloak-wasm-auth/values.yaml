@@ -1,0 +1,64 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: ghcr.io
+  # Replace with real image path
+  repository: your-org/istio-keycloak-wasm-plugin
+  tag: "0.3.0"
+  # ImagePullSecret name for private registry (leave empty for public ghcr.io)
+  pullSecret: ""
+
+keycloak:
+  host: keycloak.example.com
+  realm: main
+  # All endpoints auto-computed from host+realm.
+  # Override via keycloak.endpoints.*
+  endpoints: {}
+  # endpoints:
+  #   issuer: ""
+  #   authorization: ""
+  #   token: ""
+  #   jwks: ""
+  #   logout: ""
+
+oidc:
+  clientId: "istio-gateway"
+  # Pass via --set or existingSecret
+  clientSecret: ""
+  redirectUri: "https://app.example.com/oauth2/callback"
+  scope: "openid profile email offline_access"
+
+session:
+  # Minimum 32 random bytes. Pass via --set or existingSecret.
+  cryptoSecret: ""
+  refreshSkewSeconds: 60
+
+# Use existing Secret instead of creating a new one.
+# Secret must have keys: client_secret and crypto_secret
+existingSecret: ""
+
+cookie:
+  domain: ".example.com"
+  path: "/"
+  secure: true
+  sameSite: "Lax"
+
+headers:
+  user: "x-user"
+  email: "x-email"
+  groups: "x-groups"
+  passAuthorization: false
+
+publicPrefixes:
+  - "/health"
+  - "/metrics"
+  - "/favicon.ico"
+  - "/assets/"
+  - "/public/"
+
+istio:
+  namespace: istio-system
+  ingressGateway:
+    selectorLabels:
+      istio: ingressgateway
