@@ -925,11 +925,19 @@ fn verify_rsa_pkcs1_sha256(
         .decode(signature_b64)
         .map_err(|e| format!("sig decode: {e}"))?;
 
+    let em_len = n_bytes.len();
+
+    if sig_bytes.len() != em_len {
+        return Err(format!(
+            "signature length {} != modulus length {}",
+            sig_bytes.len(),
+            em_len
+        ));
+    }
+
     let n = BigUint::from_bytes_be(&n_bytes);
     let e = BigUint::from_bytes_be(&e_bytes);
     let sig = BigUint::from_bytes_be(&sig_bytes);
-
-    let em_len = n_bytes.len();
 
     // RSA public key operation: m = sig^e mod n
     let m = sig.modpow(&e, &n);
