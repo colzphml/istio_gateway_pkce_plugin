@@ -1,0 +1,8 @@
+ВАЖНО
+
+1. Путь /oauth2/callback должен доходить до ingress gateway и не ломаться роутингом приложения.
+2. Обычно этого достаточно, если ваш Gateway/VirtualService уже принимает host app.example.com
+   и отправляет трафик в ваш backend.
+3. Плагин работает на ingress gateway и перехватывает callback раньше backend-логики.
+4. Отдельный backend endpoint для /oauth2/callback не нужен.
+5. Но если у вас в роутинге есть жёсткие path-match правила, убедитесь, что /oauth2/callback не отбрасывается.

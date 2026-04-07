@@ -1,0 +1,45 @@
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: keycloak-auth-wasm
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels:
+      istio: ingressgateway
+  url: oci://ghcr.io/your-org/istio-keycloak-wasm-plugin:0.3.0
+  phase: AUTHN
+  pluginConfig:
+    issuer: "https://keycloak.example.com/realms/main"
+    authorization_endpoint: "https://keycloak.example.com/realms/main/protocol/openid-connect/auth"
+    token_endpoint: "https://keycloak.example.com/realms/main/protocol/openid-connect/token"
+    jwks_uri: "https://keycloak.example.com/realms/main/protocol/openid-connect/certs"
+    logout_endpoint: "https://keycloak.example.com/realms/main/protocol/openid-connect/logout"
+
+    client_id: "istio-gateway"
+    client_secret: "REPLACE_ME"
+    redirect_uri: "https://app.example.com/oauth2/callback"
+    scope: "openid profile email offline_access"
+
+    cookie_domain: ".example.com"
+    cookie_path: "/"
+    cookie_secure: true
+    cookie_samesite: "Lax"
+
+    crypto_secret: "CHANGE_ME_TO_LONG_RANDOM_SECRET_AT_LEAST_32_BYTES"
+
+    upstream_cluster: "outbound|443||keycloak.example.com"
+
+    refresh_skew_seconds: 60
+    pass_authorization_header: false
+
+    user_header: "x-user"
+    email_header: "x-email"
+    groups_header: "x-groups"
+
+    public_prefixes:
+      - "/health"
+      - "/metrics"
+      - "/favicon.ico"
+      - "/assets/"
+      - "/public/"
