@@ -3,7 +3,7 @@ name: keycloak-wasm-auth
 description: Istio WasmPlugin for PKCE OIDC authentication via Keycloak
 type: application
 version: 0.1.0
-appVersion: "0.3.0"
+appVersion: "0.1.0"
 keywords:
   - istio
   - keycloak

@@ -5,7 +5,7 @@ image:
   registry: ghcr.io
   # Replace with real image path
   repository: your-org/istio-keycloak-wasm-plugin
-  tag: "0.3.0"
+  tag: "0.1.0"
   # ImagePullSecret name for private registry (leave empty for public ghcr.io)
   pullSecret: ""
 
