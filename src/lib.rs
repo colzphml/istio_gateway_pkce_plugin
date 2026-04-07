@@ -234,6 +234,35 @@ impl RootContext for AuthRoot {
                     ]);
                 }
 
+                // Override sensitive fields from env vars if set via vmConfig.env
+                if let Ok(v) = std::env::var("OIDC_CLIENT_SECRET") {
+                    if !v.is_empty() {
+                        cfg.client_secret = v;
+                    }
+                }
+                if let Ok(v) = std::env::var("SESSION_CRYPTO_SECRET") {
+                    if !v.is_empty() {
+                        cfg.crypto_secret = v;
+                    }
+                }
+
+                if cfg.client_secret.is_empty() {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Error,
+                        "client_secret not set (pluginConfig or OIDC_CLIENT_SECRET env var)",
+                    )
+                    .ok();
+                    return false;
+                }
+                if cfg.crypto_secret.is_empty() {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Error,
+                        "crypto_secret not set (pluginConfig or SESSION_CRYPTO_SECRET env var)",
+                    )
+                    .ok();
+                    return false;
+                }
+
                 self.cfg = Some(cfg);
                 true
             }
