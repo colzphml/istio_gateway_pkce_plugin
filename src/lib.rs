@@ -127,7 +127,6 @@ struct Jwk {
 #[derive(Default)]
 struct AuthRoot {
     cfg: Option<PluginConfig>,
-    jwks_cache_raw: Option<String>,
     jwks_cache_loaded_at: u64,
     jwks_refresh_in_flight: bool,
 }
@@ -217,7 +216,7 @@ impl RootContext for AuthRoot {
         };
 
         let now = now_epoch_sec();
-        let need_refresh = self.jwks_cache_raw.is_none()
+        let need_refresh = self.jwks_cache_loaded_at == 0
             || now.saturating_sub(self.jwks_cache_loaded_at) >= JWKS_CACHE_TTL_SEC;
 
         if !need_refresh || self.jwks_refresh_in_flight {
@@ -274,9 +273,19 @@ impl RootContext for AuthRoot {
 
         match std::str::from_utf8(&body) {
             Ok(s) => {
-                self.jwks_cache_raw = Some(s.to_string());
-                self.jwks_cache_loaded_at = now_epoch_sec();
-                proxy_wasm::hostcalls::log(LogLevel::Info, "jwks cache updated").ok();
+                if self
+                    .set_shared_data("jwks_cache", Some(s.as_bytes()), None)
+                    .is_ok()
+                {
+                    self.jwks_cache_loaded_at = now_epoch_sec();
+                    proxy_wasm::hostcalls::log(LogLevel::Info, "jwks cache updated").ok();
+                } else {
+                    proxy_wasm::hostcalls::log(
+                        LogLevel::Warn,
+                        "jwks shared_data write failed",
+                    )
+                    .ok();
+                }
             }
             Err(e) => {
                 proxy_wasm::hostcalls::log(
@@ -499,13 +508,9 @@ impl AuthHttp {
     }
 
     fn get_jwks_cached(&self) -> Option<Jwks> {
-        let ctx_id = self.get_root_context_id()?;
-        let raw = self.get_shared_data(&format!("jwks:{ctx_id}")).ok().flatten();
-        if let Some((bytes, _cas)) = raw {
-            serde_json::from_slice::<Jwks>(&bytes).ok()
-        } else {
-            None
-        }
+        let (bytes_opt, _cas) = self.get_shared_data("jwks_cache");
+        let bytes = bytes_opt?;
+        serde_json::from_slice::<Jwks>(&bytes).ok()
     }
 
     fn redirect_to_login(&mut self, rd: &str) -> Action {
