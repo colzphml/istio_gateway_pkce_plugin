@@ -10,25 +10,31 @@
 
 ## 1. Настройка Keycloak client
 
-В Keycloak Admin Console:
+В Keycloak Admin Console создать клиент: **Clients → Create client**
+- Client ID: `istio-gateway` (или свой)
+- Client type: `OpenID Connect`
 
-1. Создать клиент: **Clients → Create client**
-   - Client ID: `istio-gateway` (или ваш)
-   - Client type: `OpenID Connect`
+Общие настройки для обоих режимов:
+- Standard flow: ✅ включить
+- Direct access grants: ❌ выключить
+- Valid redirect URIs: `https://app.example.com/oauth2/callback`
+- Web origins: `https://app.example.com`
+- Advanced → Proof Key for Code Exchange Code Challenge Method: `S256`
 
-2. Настройки клиента:
-   - Standard flow: ✅ включить
-   - Direct access grants: ❌ выключить
-   - Valid redirect URIs: `https://app.example.com/oauth2/callback`
-   - Web origins: `https://app.example.com`
+### Вариант A: Public client (PKCE без секрета)
 
-3. Advanced → Proof Key for Code Exchange Code Challenge Method: `S256`
+- **Client authentication: OFF**
+- `oidc.clientSecret` в Helm не нужен
 
-4. Credentials → Client secret: скопировать значение
+### Вариант B: Confidential client (PKCE + секрет)
 
-5. Если нужны группы в токене: Client Scopes → Add mapper → Group Membership → Token Claim Name: `groups`
+- **Client authentication: ON**
+- Credentials → Client secret: скопировать значение
+- Передать в Helm через `--set oidc.clientSecret="..."`
 
-## 2. Подготовка секрета crypto_secret
+Если нужны группы в токене: Client Scopes → Add mapper → Group Membership → Token Claim Name: `groups`
+
+## 2. Подготовка crypto_secret
 
 Сгенерировать случайный секрет (минимум 32 байта):
 
@@ -38,6 +44,21 @@ openssl rand -base64 32
 
 ## 3. Установка через Helm
 
+### Public client (без client_secret)
+
+```bash
+helm install keycloak-auth helm/keycloak-wasm-auth \
+  --namespace istio-system \
+  --set keycloak.host=keycloak.example.com \
+  --set keycloak.realm=main \
+  --set oidc.clientId=istio-gateway \
+  --set oidc.redirectUri="https://app.example.com/oauth2/callback" \
+  --set session.cryptoSecret="$(openssl rand -base64 32)" \
+  --set cookie.domain=".example.com"
+```
+
+### Confidential client (с client_secret)
+
 ```bash
 helm install keycloak-auth helm/keycloak-wasm-auth \
   --namespace istio-system \
@@ -46,11 +67,11 @@ helm install keycloak-auth helm/keycloak-wasm-auth \
   --set oidc.clientId=istio-gateway \
   --set oidc.clientSecret="<client_secret из Keycloak>" \
   --set oidc.redirectUri="https://app.example.com/oauth2/callback" \
-  --set session.cryptoSecret="<вывод openssl rand -base64 32>" \
+  --set session.cryptoSecret="$(openssl rand -base64 32)" \
   --set cookie.domain=".example.com"
 ```
 
-Или через `values-override.yaml`:
+### Через values-override.yaml
 
 ```yaml
 keycloak:
@@ -60,6 +81,7 @@ keycloak:
 oidc:
   clientId: istio-gateway
   redirectUri: https://app.example.com/oauth2/callback
+  # clientSecret: ""  # оставить пустым для public client
 
 cookie:
   domain: .example.com
@@ -69,8 +91,8 @@ cookie:
 helm install keycloak-auth helm/keycloak-wasm-auth \
   --namespace istio-system \
   -f values-override.yaml \
-  --set oidc.clientSecret="..." \
-  --set session.cryptoSecret="..."
+  --set session.cryptoSecret="$(openssl rand -base64 32)"
+  # добавить --set oidc.clientSecret="..." для confidential client
 ```
 
 ## 4. Использование существующего Secret
@@ -78,10 +100,17 @@ helm install keycloak-auth helm/keycloak-wasm-auth \
 Если секрет уже создан вне Helm:
 
 ```bash
+# Confidential client
 kubectl create secret generic my-keycloak-secret \
   --namespace istio-system \
-  --from-literal=client_secret="..." \
-  --from-literal=crypto_secret="..."
+  --from-literal=client_secret="<secret>" \
+  --from-literal=crypto_secret="<openssl rand -base64 32>"
+
+# Public client — client_secret оставить пустым
+kubectl create secret generic my-keycloak-secret \
+  --namespace istio-system \
+  --from-literal=client_secret="" \
+  --from-literal=crypto_secret="<openssl rand -base64 32>"
 ```
 
 ```bash
@@ -106,7 +135,7 @@ kubectl logs -n istio-system -l istio=ingressgateway -c istio-proxy --tail=50 | 
 
 # Тест: запрос без сессии должен редиректить в Keycloak
 curl -v https://app.example.com/ 2>&1 | grep -E "Location:|< HTTP"
-# Ожидаем: HTTP/2 302, Location: https://keycloak.example.com/realms/.../auth?...
+# Ожидаем: HTTP/2 302, Location: https://keycloak.example.com/realms/.../auth?code_challenge=...
 ```
 
 ## 6. Эндпоинты плагина
@@ -121,13 +150,13 @@ curl -v https://app.example.com/ 2>&1 | grep -E "Location:|< HTTP"
 
 После успешной аутентификации бэкенд получает:
 
-| Заголовок | Значение |
-|-----------|----------|
-| `x-user` | `preferred_username` из токена |
-| `x-email` | email пользователя |
-| `x-groups` | группы через запятую |
+| Заголовок | Значение | Настройка |
+|-----------|----------|-----------|
+| `x-user` | `preferred_username` из токена | `headers.user` |
+| `x-email` | email пользователя | `headers.email` |
+| `x-groups` | группы через запятую | `headers.groups` |
 
-Имена заголовков настраиваются через `headers.user`, `headers.email`, `headers.groups`.
+Для проброса `Authorization: Bearer <access_token>` в бэкенд: `headers.passAuthorization: true`.
 
 ## 8. Переключение на приватный registry (Harbor)
 
